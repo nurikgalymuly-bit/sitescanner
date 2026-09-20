@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Данные сканирований (база и результаты)
+database.db
+reports/
