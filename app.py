@@ -26,16 +26,28 @@ app.json.ensure_ascii = False
 CORS(app)
 
 scan_lock = threading.Lock()
+current_scan = {'id': None, 'process': None, 'cancelled': False}
+current_scan_guard = threading.Lock()
 
-STEPS = [
-    ('host-discovery.py', 'Поиск хоста и проверка доступности'),
-    ('top-port-scan.py', 'Сканирование открытых портов'),
-    ('os-detection.py', 'Определение операционной системы'),
-    ('service-scan.py', 'Определение служб на портах'),
-    ('ssl-certs.py', 'Проверка SSL-сертификатов'),
-    ('ssl-ciphers.py', 'Проверка защиты соединения (TLS)'),
-]
-STEP_TIMEOUT = 300
+ALL_STEPS = {
+    'discovery': ('host-discovery.py', 'Поиск хоста и проверка доступности'),
+    'ports': ('top-port-scan.py', 'Сканирование открытых портов'),
+    'os': ('os-detection.py', 'Определение операционной системы'),
+    'services': ('service-scan.py', 'Определение служб на портах'),
+    'ssl_certs': ('ssl-certs.py', 'Проверка SSL-сертификатов'),
+    'ssl_ciphers': ('ssl-ciphers.py', 'Проверка защиты соединения (TLS)'),
+    'headers': ('headers-check.py', 'Проверка заголовков безопасности'),
+    'vuln': ('vuln-scan.py', 'Поиск известных уязвимостей'),
+    'nikto': ('nikto-scan.py', 'Базовое сканирование веб-уязвимостей'),
+}
+
+REQUIRED_STEPS = ['discovery', 'ports', 'os', 'services', 'ssl_certs']
+
+STEP_TIMEOUTS = {
+    'vuln': 240,
+    'nikto': 200,
+}
+DEFAULT_TIMEOUT = 120
 
 DOMAIN_RE = re.compile(r'^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 
@@ -60,38 +72,70 @@ def clean_stage_dirs():
         folder = os.path.join(REPORTS_DIR, stage)
         os.makedirs(folder, exist_ok=True)
         for name in os.listdir(folder):
-            if name.endswith('.xml'):
+            if name.endswith(('.xml', '.json', '.txt')):
                 os.remove(os.path.join(folder, name))
 
 
-def run_scan(scan_id, target):
+def run_scan(scan_id, target, checks):
     label = ''
     try:
         clean_stage_dirs()
         env = os.environ.copy()
         env['SCAN_TARGET'] = target
 
-        for script, label in STEPS:
+        steps_to_run = list(dict.fromkeys(REQUIRED_STEPS + checks))
+
+        for key in steps_to_run:
+            with current_scan_guard:
+                if current_scan['cancelled']:
+                    mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
+                    return
+
+            if key not in ALL_STEPS:
+                continue
+            script, label = ALL_STEPS[key]
             update_scan_step(scan_id, label)
-            result = subprocess.run(
+            timeout = STEP_TIMEOUTS.get(key, DEFAULT_TIMEOUT)
+
+            process = subprocess.Popen(
                 [sys.executable, os.path.join(SCANNER_DIR, script)],
                 cwd=SCANNER_DIR,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=STEP_TIMEOUT,
             )
-            if result.returncode != 0:
-                mark_scan_error(scan_id, f'Ошибка на этапе «{label}»: {result.stderr[-500:]}')
+            with current_scan_guard:
+                current_scan['process'] = process
+
+            try:
+                _, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                mark_scan_error(scan_id, f'Этап «{label}» выполнялся слишком долго')
+                return
+
+            with current_scan_guard:
+                was_cancelled = current_scan['cancelled']
+
+            if was_cancelled:
+                mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
+                return
+
+            if process.returncode != 0:
+                mark_scan_error(scan_id, f'Ошибка на этапе «{label}»: {stderr[-500:]}')
                 return
 
         update_scan_step(scan_id, 'Формирование отчёта')
         mark_scan_done(scan_id, build_report_dict(target))
-    except subprocess.TimeoutExpired:
-        mark_scan_error(scan_id, f'Этап «{label}» выполнялся слишком долго')
     except Exception as e:
         mark_scan_error(scan_id, str(e))
     finally:
+        with current_scan_guard:
+            current_scan['id'] = None
+            current_scan['process'] = None
+            current_scan['cancelled'] = False
         scan_lock.release()
 
 
@@ -99,6 +143,8 @@ def run_scan(scan_id, target):
 def start_scan():
     data = request.get_json(silent=True) or {}
     target = clean_target(data.get('target'))
+    checks = data.get('checks') or []
+    checks = [c for c in checks if c in ALL_STEPS]
 
     if not is_valid_target(target):
         return jsonify({'error': 'Некорректный адрес. Введите домен (example.com) или IPv4-адрес.'}), 400
@@ -108,12 +154,30 @@ def start_scan():
 
     try:
         scan_id = create_scan(target)
-        threading.Thread(target=run_scan, args=(scan_id, target), daemon=True).start()
+        with current_scan_guard:
+            current_scan['id'] = scan_id
+            current_scan['process'] = None
+            current_scan['cancelled'] = False
+        threading.Thread(target=run_scan, args=(scan_id, target, checks), daemon=True).start()
     except Exception:
         scan_lock.release()
         raise
 
     return jsonify({'scan_id': scan_id, 'status': 'running'}), 202
+
+
+@app.route('/api/scan/<int:scan_id>/cancel', methods=['POST'])
+def cancel_scan(scan_id):
+    with current_scan_guard:
+        if current_scan['id'] != scan_id:
+            return jsonify({'error': 'Этот скан уже не выполняется'}), 409
+        current_scan['cancelled'] = True
+        process = current_scan['process']
+
+    if process is not None and process.poll() is None:
+        process.kill()
+
+    return jsonify({'status': 'cancelling'})
 
 
 @app.route('/api/scan/<int:scan_id>/status', methods=['GET'])

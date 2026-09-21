@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import xml.etree.ElementTree as ET
+import json
 import os
 
 STAGE1 = os.path.expanduser('~/Документы/sitescanner/reports/Stage_1')
@@ -53,6 +54,7 @@ def get_open_ports(xml_path):
             service = service_el.get('name') if service_el is not None else '?'
             open_ports.append({'port': int(portid), 'protocol': proto, 'service': service})
         if open_ports:
+            open_ports.sort(key=lambda p: p['port'])
             result[addr] = open_ports
     return result
 
@@ -72,6 +74,7 @@ def get_os_matches():
                     'name': match.get('name'),
                     'accuracy': int(match.get('accuracy'))
                 })
+        matches.sort(key=lambda m: m['accuracy'], reverse=True)
         result[addr] = matches
     return result
 
@@ -93,14 +96,8 @@ def get_services():
                 portid = port.get('portid')
                 service_el = port.find('service')
                 name = service_el.get('name', '?') if service_el is not None else '?'
-                product = service_el.get('product', '') if service_el is not None else ''
-                version = service_el.get('version', '') if service_el is not None else ''
-                services.append({
-                    'port': int(portid),
-                    'name': name,
-                    'product': product or None,
-                    'version': version or None,
-                })
+                services.append({'port': int(portid), 'name': name})
+        services.sort(key=lambda s: s['port'])
         result[addr] = services
     return result
 
@@ -183,8 +180,54 @@ def get_ssl_ciphers():
                         'protocols': protocols,
                         'grade': strength,
                     })
+        ciphers.sort(key=lambda c: c['port'])
         result[addr] = ciphers
     return result
+
+
+def get_headers_check():
+    path = os.path.join(STAGE2, 'headers_check.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def get_vuln_findings():
+    root = safe_parse(os.path.join(STAGE2, 'vuln_scan.xml'))
+    if root is None:
+        return []
+    findings = []
+    for host in root.findall('host'):
+        ports_el = host.find('ports')
+        if ports_el is None:
+            continue
+        for port in ports_el.findall('port'):
+            portid = port.get('portid')
+            for script in port.findall('script'):
+                output = script.get('output', '').strip()
+                if not output or 'not vulnerable' in output.lower() or output.upper().startswith('ERROR'):
+                    continue
+                findings.append({
+                    'port': int(portid),
+                    'script': script.get('id'),
+                    'output': output,
+                })
+    return findings
+
+
+def get_nikto_findings():
+    path = os.path.join(STAGE2, 'nikto_scan.txt')
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            return [line.strip() for line in f if line.strip().startswith('+')]
+    except OSError:
+        return []
 
 
 def build_report_dict(target):
@@ -194,6 +237,9 @@ def build_report_dict(target):
     services = get_services()
     certs = get_ssl_certs()
     ciphers = get_ssl_ciphers()
+    headers_check = get_headers_check()
+    vuln_findings = get_vuln_findings()
+    nikto_findings = get_nikto_findings()
 
     report = {
         'target': target,
@@ -209,11 +255,13 @@ def build_report_dict(target):
             'services': services.get(addr, []),
             'ssl_certs': certs.get(addr, []),
             'ssl_ciphers': ciphers.get(addr, []),
+            'headers_check': headers_check,
+            'vuln_findings': vuln_findings,
+            'nikto_findings': nikto_findings,
         })
 
     return report
 
 
 if __name__ == '__main__':
-    import json
     print(json.dumps(build_report_dict('test'), ensure_ascii=False, indent=2))
