@@ -219,15 +219,64 @@ def get_vuln_findings():
     return findings
 
 
+NIKTO_EXPLANATIONS = [
+    (r'without the httponly flag.*Cookie (\w+)',
+     'Кука «{0}» доступна из JavaScript — при наличии XSS-уязвимости её можно украсть и получить доступ к сессии пользователя.'),
+    (r'without the httponly flag',
+     'Одна из кук установлена без защиты HttpOnly — её может прочитать вредоносный JavaScript-код на странице.'),
+    (r'missing:\s*strict-transport-security',
+     'Отсутствует заголовок HSTS — браузер не принуждает использовать только HTTPS, возможна атака с понижением до незащищённого HTTP.'),
+    (r'missing:\s*content-security-policy',
+     'Отсутствует Content-Security-Policy — нет защиты от внедрения чужих скриптов (XSS-атак).'),
+    (r'missing:\s*x-content-type-options',
+     'Отсутствует X-Content-Type-Options — браузер может неверно определить тип файла, что открывает путь к атакам через подмену контента.'),
+    (r'missing:\s*x-frame-options',
+     'Отсутствует X-Frame-Options — сайт можно встроить в чужую страницу через iframe (риск clickjacking-атак).'),
+    (r'missing:\s*referrer-policy',
+     'Отсутствует Referrer-Policy — при переходах на другие сайты может передаваться лишняя информация об адресе страницы.'),
+    (r'missing:\s*permissions-policy',
+     'Отсутствует Permissions-Policy — не ограничен доступ сайта к камере, микрофону, геолокации и другим функциям браузера.'),
+    (r'Server: (.+)',
+     'Сервер раскрывает свою версию в заголовке ответа: {0}. Это упрощает поиск известных уязвимостей для конкретной версии.'),
+    (r'ERROR: Failed to check for updates', None),  # техническое сообщение самого nikto, скрываем
+]
+
+
+def explain_nikto_line(line):
+    import re
+    for pattern, template in NIKTO_EXPLANATIONS:
+        match = re.search(pattern, line, re.IGNORECASE)
+        if match:
+            if template is None:
+                return None
+            try:
+                return template.format(*match.groups())
+            except (IndexError, KeyError):
+                return template
+    return None
+
+
 def get_nikto_findings():
     path = os.path.join(STAGE2, 'nikto_scan.txt')
     if not os.path.exists(path):
         return []
     try:
         with open(path, encoding='utf-8', errors='ignore') as f:
-            return [line.strip() for line in f if line.strip().startswith('+')]
+            raw_lines = [line.strip() for line in f if line.strip().startswith('+')]
     except OSError:
         return []
+
+    findings = []
+    seen = set()
+    for line in raw_lines:
+        explanation = explain_nikto_line(line)
+        if explanation is None:
+            continue
+        if explanation in seen:
+            continue
+        seen.add(explanation)
+        findings.append(explanation)
+    return findings
 
 
 def build_report_dict(target):

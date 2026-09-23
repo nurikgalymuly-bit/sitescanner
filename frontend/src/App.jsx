@@ -11,6 +11,12 @@ const CHECK_OPTIONS = [
   { key: 'nikto', label: 'Базовое сканирование веб-уязвимостей (nikto)' },
 ]
 
+const PORT_DEPTH_OPTIONS = [
+  { key: 'fast', label: 'Быстро (100 портов)' },
+  { key: 'normal', label: 'Стандартно (1000 портов)' },
+  { key: 'full', label: 'Полностью (65535 портов)' },
+]
+
 const DEFAULT_CHECKS = ['ssl_ciphers']
 
 const stripCN = (s) => (s || '').replace('commonName=', '')
@@ -118,15 +124,15 @@ function HostCard({ host }) {
       )}
 
       {host.nikto_findings.length > 0 && (
-        <>
-          <h3>Находки nikto</h3>
-          <ul>
-            {host.nikto_findings.map((line, i) => (
-              <li key={i}>{line.replace(/^\+\s*/, '')}</li>
-            ))}
-          </ul>
-        </>
-      )}
+  <>
+    <h3>Возможные проблемы (найдено сканером nikto)</h3>
+    <ul>
+      {host.nikto_findings.map((line, i) => (
+        <li key={i}>{line}</li>
+      ))}
+    </ul>
+  </>
+)}
     </section>
   )
 }
@@ -145,6 +151,7 @@ function Report({ report }) {
 function App() {
   const [target, setTarget] = useState('')
   const [checks, setChecks] = useState(DEFAULT_CHECKS)
+  const [portDepth, setPortDepth] = useState('fast')
   const [scanId, setScanId] = useState(null)
   const [status, setStatus] = useState('idle')
   const [error, setError] = useState('')
@@ -166,7 +173,7 @@ function App() {
       const res = await fetch(`${API}/api/scan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target, checks }),
+        body: JSON.stringify({ target, checks, port_depth: portDepth }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Не удалось запустить сканирование')
@@ -245,6 +252,20 @@ function App() {
     Отчёт
   </button>
 </form>
+
+<div className="checks">
+  {PORT_DEPTH_OPTIONS.map((opt) => (
+    <label key={opt.key} className="check">
+      <input
+        type="radio"
+        name="portDepth"
+        checked={portDepth === opt.key}
+        onChange={() => setPortDepth(opt.key)}
+      />
+      {opt.label}
+    </label>
+  ))}
+</div>
 
       <div className="checks">
         {CHECK_OPTIONS.map((opt) => (

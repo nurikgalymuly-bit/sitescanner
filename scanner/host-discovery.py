@@ -2,37 +2,22 @@
 
 import shlex
 import subprocess
+import threading
 import os
 import sys
 
 
 def sendIcmpEcho(target, out_xml):
-    out_xml = os.path.join(out_xml,'icmp_echo_host_discovery.xml')
-    nmap_cmd = f"/usr/bin/nmap --privileged {target} -n -sn -PE -vv -oX {out_xml}"                     
-    sub_args = shlex.split(nmap_cmd)
-    subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-    makeInvokerOwner(out_xml)
-
-
-def sendIcmpNetmask(target, out_xml):
-    out_xml = os.path.join(out_xml,'icmp_netmask_host_discovery.xml')
-    nmap_cmd = f"/usr/bin/nmap --privileged {target} -n -sn -PM -vv -oX {out_xml}"
-    sub_args = shlex.split(nmap_cmd)
-    subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-    makeInvokerOwner(out_xml)
-
-
-def sendIcmpTimestamp(target, out_xml):
-    out_xml = os.path.join(out_xml,'icmp_timestamp_host_discovery.xml')
-    nmap_cmd = f"/usr/bin/nmap --privileged {target} -n -sn -PP -vv -oX {out_xml}"
+    out_xml = os.path.join(out_xml, 'icmp_echo_host_discovery.xml')
+    nmap_cmd = f"/usr/bin/nmap --privileged {target} -n -sn -PE --host-timeout 30s -vv -oX {out_xml}"
     sub_args = shlex.split(nmap_cmd)
     subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     makeInvokerOwner(out_xml)
 
 
 def sendTcpSyn(target, out_xml):
-    out_xml = os.path.join(out_xml,'tcp_syn_host_discovery.xml')
-    nmap_cmd = f"/usr/bin/nmap --privileged {target} -PS21,22,23,25,80,113,443 -PA80,113,443 -n -sn -T4 -vv -oX {out_xml}"
+    out_xml = os.path.join(out_xml, 'tcp_syn_host_discovery.xml')
+    nmap_cmd = f"/usr/bin/nmap --privileged {target} -PS21,22,23,25,80,113,443 -PA80,113,443 -n -sn -T5 --host-timeout 30s -vv -oX {out_xml}"
     sub_args = shlex.split(nmap_cmd)
     subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     makeInvokerOwner(out_xml)
@@ -56,13 +41,19 @@ def main():
     if not is_root():
         print('[!] The discovery probes in this script requires root privileges')
         sys.exit(1)
-    
-    target = os.environ.get('SCAN_TARGET', '127.0.0.1')
 
-    sendIcmpEcho(target, '/home/cherry/Документы/sitescanner/reports/Stage_1')
-    sendIcmpNetmask(target, '/home/cherry/Документы/sitescanner/reports/Stage_1')
-    sendIcmpTimestamp(target, '/home/cherry/Документы/sitescanner/reports/Stage_1')
-    sendTcpSyn(target, '/home/cherry/Документы/sitescanner/reports/Stage_1')
+    target = os.environ.get('SCAN_TARGET', '127.0.0.1')
+    out_dir = '/home/cherry/Документы/sitescanner/reports/Stage_1'
+
+    threads = [
+        threading.Thread(target=sendIcmpEcho, args=(target, out_dir)),
+        threading.Thread(target=sendTcpSyn, args=(target, out_dir)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
 
 if __name__ == '__main__':
     main()

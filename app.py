@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify
@@ -26,7 +27,7 @@ app.json.ensure_ascii = False
 CORS(app)
 
 scan_lock = threading.Lock()
-current_scan = {'id': None, 'process': None, 'cancelled': False}
+current_scan = {'id': None, 'processes': [], 'cancelled': False}
 current_scan_guard = threading.Lock()
 
 ALL_STEPS = {
@@ -41,13 +42,21 @@ ALL_STEPS = {
     'nikto': ('nikto-scan.py', 'Базовое сканирование веб-уязвимостей'),
 }
 
-REQUIRED_STEPS = ['discovery', 'ports', 'os', 'services', 'ssl_certs']
+SEQUENTIAL_STEPS = ['discovery', 'ports']
+REQUIRED_PARALLEL_STEPS = ['os', 'services', 'ssl_certs']
 
 STEP_TIMEOUTS = {
-    'vuln': 240,
-    'nikto': 200,
+    'vuln': 120,
+    'nikto': 170,
 }
-DEFAULT_TIMEOUT = 120
+DEFAULT_TIMEOUT = 90
+
+PORT_DEPTHS = {
+    'fast': '--top-ports 100',
+    'normal': '--top-ports 1000',
+    'full': '-p-',
+}
+DEFAULT_PORT_DEPTH = 'normal'
 
 DOMAIN_RE = re.compile(r'^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 
@@ -76,56 +85,85 @@ def clean_stage_dirs():
                 os.remove(os.path.join(folder, name))
 
 
-def run_scan(scan_id, target, checks):
-    label = ''
+def register_process(process):
+    with current_scan_guard:
+        current_scan['processes'].append(process)
+
+
+def is_cancelled():
+    with current_scan_guard:
+        return current_scan['cancelled']
+
+
+def run_step(key, env, timeout):
+    script, label = ALL_STEPS[key]
+    process = subprocess.Popen(
+        [sys.executable, os.path.join(SCANNER_DIR, script)],
+        cwd=SCANNER_DIR,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    register_process(process)
+
+    try:
+        _, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return key, label, False, f'Этап «{label}» выполнялся слишком долго'
+
+    if is_cancelled():
+        return key, label, False, 'Сканирование остановлено пользователем'
+
+    if process.returncode != 0:
+        return key, label, False, f'Ошибка на этапе «{label}»: {stderr[-500:]}'
+
+    return key, label, True, None
+
+
+def run_scan(scan_id, target, checks, port_depth):
     try:
         clean_stage_dirs()
         env = os.environ.copy()
         env['SCAN_TARGET'] = target
+        env['PORT_FLAG'] = PORT_DEPTHS.get(port_depth, PORT_DEPTHS[DEFAULT_PORT_DEPTH])
 
-        steps_to_run = list(dict.fromkeys(REQUIRED_STEPS + checks))
-
-        for key in steps_to_run:
-            with current_scan_guard:
-                if current_scan['cancelled']:
-                    mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
-                    return
-
-            if key not in ALL_STEPS:
-                continue
+        for key in SEQUENTIAL_STEPS:
+            if is_cancelled():
+                mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
+                return
             script, label = ALL_STEPS[key]
             update_scan_step(scan_id, label)
             timeout = STEP_TIMEOUTS.get(key, DEFAULT_TIMEOUT)
-
-            process = subprocess.Popen(
-                [sys.executable, os.path.join(SCANNER_DIR, script)],
-                cwd=SCANNER_DIR,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            with current_scan_guard:
-                current_scan['process'] = process
-
-            try:
-                _, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                mark_scan_error(scan_id, f'Этап «{label}» выполнялся слишком долго')
+            _, _, ok, err = run_step(key, env, timeout)
+            if not ok:
+                mark_scan_error(scan_id, err)
                 return
 
-            with current_scan_guard:
-                was_cancelled = current_scan['cancelled']
+        parallel_keys = list(dict.fromkeys(REQUIRED_PARALLEL_STEPS + [c for c in checks if c in ALL_STEPS]))
+        labels = [ALL_STEPS[k][1] for k in parallel_keys]
+        update_scan_step(scan_id, 'Одновременно: ' + ', '.join(labels))
 
-            if was_cancelled:
-                mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
-                return
+        errors = []
+        with ThreadPoolExecutor(max_workers=len(parallel_keys)) as executor:
+            futures = {
+                executor.submit(run_step, key, env, STEP_TIMEOUTS.get(key, DEFAULT_TIMEOUT)): key
+                for key in parallel_keys
+            }
+            for future in as_completed(futures):
+                _, label, ok, err = future.result()
+                if not ok:
+                    errors.append(err)
 
-            if process.returncode != 0:
-                mark_scan_error(scan_id, f'Ошибка на этапе «{label}»: {stderr[-500:]}')
-                return
+        if is_cancelled():
+            mark_scan_error(scan_id, 'Сканирование остановлено пользователем')
+            return
+
+        if errors:
+            mark_scan_error(scan_id, errors[0])
+            return
 
         update_scan_step(scan_id, 'Формирование отчёта')
         mark_scan_done(scan_id, build_report_dict(target))
@@ -134,7 +172,7 @@ def run_scan(scan_id, target, checks):
     finally:
         with current_scan_guard:
             current_scan['id'] = None
-            current_scan['process'] = None
+            current_scan['processes'] = []
             current_scan['cancelled'] = False
         scan_lock.release()
 
@@ -145,6 +183,9 @@ def start_scan():
     target = clean_target(data.get('target'))
     checks = data.get('checks') or []
     checks = [c for c in checks if c in ALL_STEPS]
+    port_depth = data.get('port_depth', DEFAULT_PORT_DEPTH)
+    if port_depth not in PORT_DEPTHS:
+        port_depth = DEFAULT_PORT_DEPTH
 
     if not is_valid_target(target):
         return jsonify({'error': 'Некорректный адрес. Введите домен (example.com) или IPv4-адрес.'}), 400
@@ -156,9 +197,9 @@ def start_scan():
         scan_id = create_scan(target)
         with current_scan_guard:
             current_scan['id'] = scan_id
-            current_scan['process'] = None
+            current_scan['processes'] = []
             current_scan['cancelled'] = False
-        threading.Thread(target=run_scan, args=(scan_id, target, checks), daemon=True).start()
+        threading.Thread(target=run_scan, args=(scan_id, target, checks, port_depth), daemon=True).start()
     except Exception:
         scan_lock.release()
         raise
@@ -172,10 +213,11 @@ def cancel_scan(scan_id):
         if current_scan['id'] != scan_id:
             return jsonify({'error': 'Этот скан уже не выполняется'}), 409
         current_scan['cancelled'] = True
-        process = current_scan['process']
+        processes = list(current_scan['processes'])
 
-    if process is not None and process.poll() is None:
-        process.kill()
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
 
     return jsonify({'status': 'cancelling'})
 

@@ -24,8 +24,9 @@ def convertToNmapTarget(hosts):
 
 
 def tcpSynPortScan(target, out_xml,):
-    out_xml = os.path.join(out_xml,'top_1000_portscan.xml')
-    nmap_cmd = f"/usr/bin/nmap --privileged {target} --top-ports 1000 -n -Pn -sS -T4 --min-parallelism 100 --min-rate 64 -vv -oX {out_xml}"
+    out_xml = os.path.join(out_xml, 'top_1000_portscan.xml')
+    port_flag = os.environ.get('PORT_FLAG', '--top-ports 1000')
+    nmap_cmd = f"/usr/bin/nmap --privileged {target} {port_flag} -n -Pn -sS -T5 --min-parallelism 300 --min-rate 1000 --max-retries 1 --host-timeout 60s -vv -oX {out_xml}"
     sub_args = shlex.split(nmap_cmd)
     subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     makeInvokerOwner(out_xml)
@@ -49,10 +50,8 @@ def main():
     if not is_root():
         print('[!] TCP/SYN scans requires root privileges')
         sys.exit(1)
-    
+
     hosts = parseDiscoverXml('/home/cherry/Документы/sitescanner/reports/Stage_1/icmp_echo_host_discovery.xml')
-    hosts += parseDiscoverXml('/home/cherry/Документы/sitescanner/reports/Stage_1/icmp_netmask_host_discovery.xml')
-    hosts += parseDiscoverXml('/home/cherry/Документы/sitescanner/reports/Stage_1/icmp_timestamp_host_discovery.xml')
     hosts += parseDiscoverXml('/home/cherry/Документы/sitescanner/reports/Stage_1/tcp_syn_host_discovery.xml')
 
     target = convertToNmapTarget(hosts)

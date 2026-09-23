@@ -26,8 +26,8 @@ def parseDiscoverPorts(in_xml):
 
 
 def serviceScan(target_ip, target_ports, out_xml):
-    out_xml = os.path.join(out_xml,f'{target_ip}_services.xml')
-    nmap_cmd = f"/usr/bin/nmap {target_ip} -p {target_ports} -n -Pn -sV --version-intensity 6 --script banner -T4 -vv -oX {out_xml}"
+    out_xml = os.path.join(out_xml, f'{target_ip}_services.xml')
+    nmap_cmd = f"/usr/bin/nmap {target_ip} -p {target_ports} -n -Pn -sV --version-intensity 2 --script banner -T5 --host-timeout 40s -vv -oX {out_xml}"
     sub_args = shlex.split(nmap_cmd)
     subprocess.Popen(sub_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
 
