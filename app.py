@@ -6,9 +6,10 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +20,11 @@ sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, SCANNER_DIR)
 
 from db import (init_db, create_scan, mark_scan_done, mark_scan_error, get_scan,
-                get_history, update_scan_step, fail_interrupted_scans)
+                get_history, update_scan_step, fail_interrupted_scans,
+                create_user, authenticate_user, get_user_by_id,
+                create_token, validate_token, delete_token, delete_expired_tokens,
+                get_all_users, get_all_scans, get_admin_stats,
+                set_user_admin, delete_user_by_id, delete_scan_by_id)
 from report_builder import build_report_dict
 
 app = Flask(__name__)
@@ -46,8 +51,8 @@ SEQUENTIAL_STEPS = ['discovery', 'ports']
 REQUIRED_PARALLEL_STEPS = ['os', 'services', 'ssl_certs']
 
 STEP_TIMEOUTS = {
-    'vuln': 120,
-    'nikto': 170,
+    'vuln': 300,
+    'nikto': 300,
 }
 DEFAULT_TIMEOUT = 90
 
@@ -60,6 +65,116 @@ DEFAULT_PORT_DEPTH = 'normal'
 
 DOMAIN_RE = re.compile(r'^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
 
+USERNAME_RE = re.compile(r'^[a-zA-Zа-яА-ЯёЁ0-9_]{3,30}$')
+MIN_PASSWORD_LENGTH = 6
+
+
+# ---------------------------------------------------------------------------
+#  Авторизация — декоратор и хелперы
+# ---------------------------------------------------------------------------
+
+def get_current_user():
+    """Извлекает пользователя из заголовка Authorization: Bearer <token>."""
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return None
+    token = auth[7:]
+    user_id = validate_token(token)
+    if user_id is None:
+        return None
+    return get_user_by_id(user_id)
+
+
+def login_required(f):
+    """Декоратор: пропускает только авторизованных пользователей."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if user is None:
+            return jsonify({'error': 'Необходимо войти в систему'}), 401
+        g.user = user
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    """Декоратор: пропускает только администраторов."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if user is None:
+            return jsonify({'error': 'Необходимо войти в систему'}), 401
+        if not user.get('is_admin'):
+            return jsonify({'error': 'Доступ запрещён: требуются права администратора'}), 403
+        g.user = user
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ---------------------------------------------------------------------------
+#  Эндпоинты авторизации
+# ---------------------------------------------------------------------------
+
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+
+    if not USERNAME_RE.match(username):
+        return jsonify({'error': 'Имя пользователя: 3–30 символов (буквы, цифры, _)'}), 400
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return jsonify({'error': f'Пароль должен быть не менее {MIN_PASSWORD_LENGTH} символов'}), 400
+
+    user_id, is_admin = create_user(username, password)
+    if user_id is None:
+        return jsonify({'error': 'Пользователь с таким именем уже существует'}), 409
+
+    token = create_token(user_id)
+    return jsonify({
+        'token': token,
+        'user': {'id': user_id, 'username': username, 'is_admin': is_admin},
+    }), 201
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+
+    user = authenticate_user(username, password)
+    if user is None:
+        return jsonify({'error': 'Неверное имя пользователя или пароль'}), 401
+
+    token = create_token(user['id'])
+    return jsonify({
+        'token': token,
+        'user': {'id': user['id'], 'username': user['username'], 'is_admin': bool(user.get('is_admin'))},
+    })
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@login_required
+def logout():
+    token = request.headers.get('Authorization', '')[7:]
+    delete_token(token)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@login_required
+def me():
+    return jsonify({'user': {
+        'id': g.user['id'],
+        'username': g.user['username'],
+        'is_admin': g.user.get('is_admin', False),
+    }})
+
+
+# ---------------------------------------------------------------------------
+#  Сканирование — хелперы
+# ---------------------------------------------------------------------------
 
 def clean_target(raw):
     raw = (raw or '').strip().lower()
@@ -177,7 +292,12 @@ def run_scan(scan_id, target, checks, port_depth):
         scan_lock.release()
 
 
+# ---------------------------------------------------------------------------
+#  Эндпоинты сканирования (защищены авторизацией)
+# ---------------------------------------------------------------------------
+
 @app.route('/api/scan', methods=['POST'])
+@login_required
 def start_scan():
     data = request.get_json(silent=True) or {}
     target = clean_target(data.get('target'))
@@ -194,7 +314,7 @@ def start_scan():
         return jsonify({'error': 'Сейчас уже идёт другое сканирование. Дождитесь его завершения.'}), 409
 
     try:
-        scan_id = create_scan(target)
+        scan_id = create_scan(target, user_id=g.user['id'])
         with current_scan_guard:
             current_scan['id'] = scan_id
             current_scan['processes'] = []
@@ -208,6 +328,7 @@ def start_scan():
 
 
 @app.route('/api/scan/<int:scan_id>/cancel', methods=['POST'])
+@login_required
 def cancel_scan(scan_id):
     with current_scan_guard:
         if current_scan['id'] != scan_id:
@@ -223,8 +344,9 @@ def cancel_scan(scan_id):
 
 
 @app.route('/api/scan/<int:scan_id>/status', methods=['GET'])
+@login_required
 def scan_status(scan_id):
-    scan = get_scan(scan_id)
+    scan = get_scan(scan_id, user_id=g.user['id'])
     if scan is None:
         return jsonify({'error': 'Скан не найден'}), 404
     return jsonify({
@@ -237,8 +359,9 @@ def scan_status(scan_id):
 
 
 @app.route('/api/scan/<int:scan_id>/report', methods=['GET'])
+@login_required
 def scan_report(scan_id):
-    scan = get_scan(scan_id)
+    scan = get_scan(scan_id, user_id=g.user['id'])
     if scan is None:
         return jsonify({'error': 'Скан не найден'}), 404
     if scan['status'] != 'done':
@@ -247,11 +370,67 @@ def scan_report(scan_id):
 
 
 @app.route('/api/history', methods=['GET'])
+@login_required
 def history():
-    return jsonify(get_history())
+    return jsonify(get_history(user_id=g.user['id']))
+
+
+# ---------------------------------------------------------------------------
+#  Эндпоинты администрирования (только для администраторов)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/admin/stats', methods=['GET'])
+@admin_required
+def admin_stats():
+    return jsonify(get_admin_stats())
+
+
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def admin_users():
+    return jsonify(get_all_users())
+
+
+@app.route('/api/admin/scans', methods=['GET'])
+@admin_required
+def admin_scans():
+    return jsonify(get_all_scans())
+
+
+@app.route('/api/admin/users/<int:user_id>/toggle-admin', methods=['POST'])
+@admin_required
+def admin_toggle_admin(user_id):
+    if user_id == g.user['id']:
+        return jsonify({'error': 'Нельзя снять права администратора с самого себя'}), 400
+    user = get_user_by_id(user_id)
+    if user is None:
+        return jsonify({'error': 'Пользователь не найден'}), 404
+    new_status = not user['is_admin']
+    set_user_admin(user_id, new_status)
+    return jsonify({'ok': True, 'is_admin': new_status})
+
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_user(user_id):
+    if user_id == g.user['id']:
+        return jsonify({'error': 'Нельзя удалить самого себя'}), 400
+    user = get_user_by_id(user_id)
+    if user is None:
+        return jsonify({'error': 'Пользователь не найден'}), 404
+    delete_user_by_id(user_id)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/scans/<int:scan_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_scan(scan_id):
+    delete_scan_by_id(scan_id)
+    return jsonify({'ok': True})
 
 
 if __name__ == '__main__':
     init_db()
     fail_interrupted_scans()
+    delete_expired_tokens()
     app.run(host='127.0.0.1', port=5000, debug=False)
