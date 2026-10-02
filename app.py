@@ -52,8 +52,8 @@ def load_env():
 load_env()
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL = 'gemini-3.5-flash'
-GEMINI_URL = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-2.5-flash-lite']
+GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 
 GEMINI_SYSTEM_PROMPT = """Ты — «SiteScanner AI» — продвинутый ИБ-аналитик (специалист по информационной безопасности) встроенный в систему сканирования веб-ресурсов SiteScanner.
 
@@ -537,23 +537,35 @@ def ask_ai():
         },
     }
 
-    try:
-        resp = http_client.post(
-            GEMINI_URL,
-            params={'key': GEMINI_API_KEY},
-            json=body,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        answer = result['candidates'][0]['content']['parts'][0]['text']
-        return jsonify({'answer': answer})
-    except http_client.exceptions.Timeout:
-        return jsonify({'error': 'Gemini не ответил вовремя. Попробуйте ещё раз.'}), 504
-    except http_client.exceptions.RequestException as e:
-        return jsonify({'error': f'Ошибка связи с Gemini: {str(e)}'}), 502
-    except (KeyError, IndexError):
-        return jsonify({'error': 'Gemini вернул некорректный ответ'}), 502
+    # Пробуем модели по очереди (fallback при 503)
+    last_error = None
+    for model in GEMINI_MODELS:
+        url = f'{GEMINI_API_BASE}/{model}:generateContent'
+        try:
+            resp = http_client.post(
+                url,
+                params={'key': GEMINI_API_KEY},
+                json=body,
+                timeout=60,
+            )
+            if resp.status_code == 503:
+                last_error = f'Модель {model} временно перегружена'
+                continue  # пробуем следующую модель
+            resp.raise_for_status()
+            result = resp.json()
+            answer = result['candidates'][0]['content']['parts'][0]['text']
+            return jsonify({'answer': answer})
+        except http_client.exceptions.Timeout:
+            last_error = 'Gemini не ответил вовремя'
+            continue
+        except http_client.exceptions.RequestException:
+            last_error = 'Ошибка связи с Gemini'
+            continue
+        except (KeyError, IndexError):
+            last_error = 'Gemini вернул некорректный ответ'
+            continue
+
+    return jsonify({'error': f'{last_error}. Попробуйте ещё раз через минуту.'}), 502
 
 
 # ---------------------------------------------------------------------------
