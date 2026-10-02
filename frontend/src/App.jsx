@@ -660,6 +660,27 @@ function HostCard({ host }) {
         </>
       )}
 
+      {host.whatweb && (
+        <>
+          <h3>Стек технологий (WhatWeb)</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {host.whatweb.split('\n').map((line, i) => (
+              <div key={i} className="chips">
+                {line.split(', ').map((item, j) => {
+                  // Делаем текст чище (убираем лишние скобки)
+                  const cleanItem = item.replace(/\[/g, ' ').replace(/\]/g, '').trim()
+                  return (
+                    <span key={j} className="chip" style={{ background: 'var(--bg-card)' }}>
+                      {cleanItem}
+                    </span>
+                  )
+                })}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       {host.nikto_findings.length > 0 && (
         <>
           <h3>{t.niktoTitle}</h3>
@@ -1056,6 +1077,7 @@ function App() {
     headers: t.checkHeaders,
     vuln: t.checkVuln,
     nikto: t.checkNikto,
+    whatweb: 'Анализ стека технологий (whatweb)' // добавил напрямую для скорости
   }
 
   const portLabels = {

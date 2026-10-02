@@ -106,6 +106,7 @@ ALL_STEPS = {
     'headers': ('headers-check.py', 'Проверка заголовков безопасности'),
     'vuln': ('vuln-scan.py', 'Поиск известных уязвимостей'),
     'nikto': ('nikto-scan.py', 'Базовое сканирование веб-уязвимостей'),
+    'whatweb': ('whatweb-scan.py', 'Анализ технологий (whatweb)'),
 }
 
 SEQUENTIAL_STEPS = ['discovery', 'ports']
@@ -114,6 +115,7 @@ REQUIRED_PARALLEL_STEPS = ['os', 'services', 'ssl_certs']
 STEP_TIMEOUTS = {
     'vuln': 300,
     'nikto': 300,
+    'whatweb': 90,
 }
 DEFAULT_TIMEOUT = 90
 
@@ -488,6 +490,10 @@ def summarize_report(report):
         nikto = host.get('nikto_findings', [])
         if nikto:
             lines.append("Nikto находки:\n" + '\n'.join(f"  - {n}" for n in nikto))
+
+        whatweb = host.get('whatweb', '')
+        if whatweb:
+            lines.append(f"Технологии (WhatWeb): {whatweb}")
 
     return '\n'.join(lines)
 

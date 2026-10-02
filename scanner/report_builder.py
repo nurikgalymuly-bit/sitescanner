@@ -279,6 +279,13 @@ def get_nikto_findings():
     return findings
 
 
+def get_whatweb_findings():
+    path = os.path.join(STAGE2, 'whatweb_scan.txt')
+    if not os.path.exists(path):
+        return ''
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
 def build_report_dict(target):
     hosts = get_live_hosts()
     ports_by_host = get_open_ports(os.path.join(STAGE2, 'top_1000_portscan.xml'))
@@ -289,6 +296,7 @@ def build_report_dict(target):
     headers_check = get_headers_check()
     vuln_findings = get_vuln_findings()
     nikto_findings = get_nikto_findings()
+    whatweb_findings = get_whatweb_findings()
 
     report = {
         'target': target,
@@ -307,8 +315,8 @@ def build_report_dict(target):
             'headers_check': headers_check,
             'vuln_findings': vuln_findings,
             'nikto_findings': nikto_findings,
+            'whatweb': whatweb_findings,
         })
-
     return report
 
 

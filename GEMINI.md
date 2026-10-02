@@ -34,9 +34,12 @@ sitescanner/
 ## Архитектура бэкенда (app.py)
 - **Flask** на `127.0.0.1:5000`, CORS включён
 - **Авторизация**: Bearer-токен в заголовке `Authorization`. `@login_required` / `@admin_required`
-- **Декораторы**: `login_required`, `admin_required` → используют `g.user`
-- **Gemini AI**: модель `gemini-3.5-flash`, URL из `.env`, промпт — ИБ-эксперт. Эндпоинт `POST /api/ask`
-- **Сканирование**: последовательные шаги (discovery→ports), потом параллельные в ThreadPoolExecutor
+- **Gemini AI**: использует fallback-список (`gemini-3.5-flash`, `3.8`, `2.5-lite`) на случай перегрузки API (503). Эндпоинт `POST /api/ask`. Ключ скрыт из сообщений об ошибках.
+- **Сканирование**: последовательные шаги (discovery→ports), потом параллельные (os, ssl, nikto, whatweb).
+- **Target Sanitization**: Фронтенд автоматически обрезает `https://` и пути из URL, чтобы Nmap не падал.
+
+## Структура файлов (дополнения)
+- `scanner/whatweb-scan.py` — утилита WhatWeb для определения стека технологий. Запускается с флагом `--color=never`.
 
 ## API эндпоинты
 | Метод | URL | Защита | Описание |
@@ -49,7 +52,7 @@ sitescanner/
 | GET | `/api/scan/<id>/status` | login | Статус скана |
 | GET | `/api/scan/<id>/report` | login | JSON-отчёт |
 | POST | `/api/scan/<id>/cancel` | login | Отменить скан |
-| GET | `/api/history` | login | История сканов юзера |
+| GET | `/api/history` | login | История сканов юзера (автообновляется после скана) |
 | POST | `/api/ask` | login | ИИ-чат. Body: `{question, history, scan_id?}` |
 | GET | `/api/admin/stats` | admin | Статистика |
 | GET | `/api/admin/users` | admin | Все пользователи |
@@ -64,27 +67,20 @@ users: id, username, password_hash, is_admin, created_at
 user_tokens: id, user_id, token, created_at, expires_at
 scans: id, user_id, target, status, current_step, error_message, report_json, created_at
 ```
-- `create_user(username, password)` → `(user_id, is_admin)` — первый user автоматически admin
-- `get_scan(scan_id, user_id=None)` — user_id=None используется для админа
-- Миграция: при старте добавляются колонки если их нет
 
 ## Фронтенд компоненты (App.jsx)
-- `AuthPage` — форма логин/регистрация
-- `Header` — шапка с именем, бейджем admin, кнопками
-- `HistoryPanel` — раскрываемая история (кнопка "📋 История")
-- `HostCard` — карточка с результатами хоста (порты, ОС, SSL, заголовки, уязвимости, nikto)
-- `Report` — список HostCard
-- `AiChat` — плавающий чат 🤖 (всегда виден). Если `scanId` есть → режим "Анализ отчёта", иначе → режим "Эксперт"
-- `AdminPanel` — вкладки: 📊 Статистика, 👥 Пользователи, 🔍 Все сканы
-- `App` — главный компонент, state: `user`, `scanId`, `report`, `showAdmin`, `showReport`
+- **i18n & Темы**: Поддержка 3 языков (RU, KZ, EN) через `LangContext` и светлой/тёмной темы через CSS-переменные (сохраняется в `localStorage`).
+- **PDF Экспорт**: Кнопка "Сохранить в PDF" (использует `@media print` для чистой печати отчёта).
+- `AuthPage` — форма логин/регистрация с выбором языка и темы.
+- `HistoryPanel` — автообновляемая история сканирований.
+- `HostCard` — включает **Дашборд уязвимостей** (🔴 Критичные, 🟠 Средние, 🔵 Инфо) и распарсенные теги WhatWeb.
+- `AiChat` — плавающий чат с кнопками "развернуть/свернуть" (⛶ / ⊡) для удобного чтения лонгридов.
+- `AdminPanel` — вкладки: 📊 Статистика, 👥 Пользователи, 🔍 Все сканы.
 
 ## Технические детали
-- `localStorage.getItem('token')` — хранение токена в браузере
-- Сканирование: `STEP_TIMEOUTS = {vuln: 300, nikto: 300}`, `DEFAULT_TIMEOUT = 90`
-- PORT_DEPTHS: fast=top-100, normal=top-1000, full=-p-
-- Werkzeug `generate_password_hash` / `check_password_hash` для паролей
-- Gemini: `POST /api/ask` принимает `{question, history: [{role, text}], scan_id?}`
-- `summarize_report(report)` — конвертирует JSON-отчёт в текст для промпта Gemini
+- Сканирование: `whatweb` добавлен в параллельные проверки (таймаут 60с).
+- Gemini API: увеличено время ожидания до 60с для thinking-моделей.
+- CSS: добавлено `overflow-wrap: anywhere` для корректного переноса длинных строк SSL-сертификатов.
 
 ## Запуск
 ```bash
@@ -99,7 +95,5 @@ npm run dev               # порт 5173
 
 ## Известные детали / особенности
 - Сканер требует root (nmap/nikto нужны привилегии)
-- Старые сканы в БД не имеют user_id (NULL) — они видны только в /api/admin/scans
 - `.env` содержит GEMINI_API_KEY — в .gitignore
-- Первый зарегистрированный пользователь = администратор автоматически
 - Команда `rm database.db` нужна чтобы сбросить всё с нуля
