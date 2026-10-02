@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -8,6 +9,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from urllib.parse import urlparse
+
+import requests as http_client
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
@@ -30,6 +33,64 @@ from report_builder import build_report_dict
 app = Flask(__name__)
 app.json.ensure_ascii = False
 CORS(app)
+
+# ---------------------------------------------------------------------------
+#  Конфигурация Gemini AI
+# ---------------------------------------------------------------------------
+
+def load_env():
+    """Загружает переменные из .env файла."""
+    env_path = os.path.join(BASE_DIR, '.env')
+    if os.path.exists(env_path):
+        with open(env_path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, value = line.partition('=')
+                    os.environ.setdefault(key.strip(), value.strip())
+
+load_env()
+
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL = 'gemini-3.5-flash'
+GEMINI_URL = f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+
+GEMINI_SYSTEM_PROMPT = """Ты — «SiteScanner AI» — продвинутый ИБ-аналитик (специалист по информационной безопасности) встроенный в систему сканирования веб-ресурсов SiteScanner.
+
+ТВОЯ ЭКСПЕРТИЗА:
+• Сетевая безопасность (открытые порты, протоколы, службы)
+• Криптография и SSL/TLS (сертификаты, шифры, оценка конфигурации)
+• Веб-безопасность (заголовки, OWASP Top 10, XSS, CSRF, инъекции)
+• Уязвимости CVE и их эксплуатация
+• Hardening серверов (Linux, Windows, Nginx, Apache)
+• Compliance (PCI DSS, GDPR, ISO 27001)
+• Мониторинг и реагирование на инциденты
+• Безопасность DNS, почтовых серверов, баз данных
+
+ФОРМАТ ОТВЕТОВ:
+1. Начинай с краткого резюме (1-2 предложения).
+2. Используй структурированный формат:
+   - **Проблема** → **Уровень опасности** (🔴 Критический / 🟠 Высокий / 🟡 Средний / 🟢 Низкий) → **Решение**
+3. Давай конкретные примеры конфигов (Nginx, Apache, .htaccess) когда уместно.
+4. Ссылайся на стандарты: CWE, CVE, OWASP когда это применимо.
+5. В конце ответа — краткое **резюме действий** в виде нумерованного списка.
+
+ПРАВИЛА:
+- Отвечай на РУССКОМ языке.
+- Если дан отчёт сканирования — анализируй именно его данные, не выдумывай.
+- Если отчёта нет — отвечай на общие вопросы по информационной безопасности как эксперт.
+- Используй markdown: **жирный**, заголовки (##, ###), списки, `код`.
+- Будь профессиональным, но дружелюбным — объясняй так, чтобы понял даже новичок.
+- Если видишь критическую проблему — выделяй её особо, начинай с неё.
+- Оценивай общий уровень защищённости по шкале от A (отлично) до F (критически плохо)."""
+
+GEMINI_SYSTEM_PROMPT_NO_REPORT = """Ты — «SiteScanner AI» — продвинутый ИБ-аналитик, встроенный в систему сканирования.
+Сейчас у пользователя нет активного отчёта. Помогай с общими вопросами по кибербезопасности:
+- Объясняй термины (порты, протоколы, уязвимости, шифрование)
+- Давай советы по защите серверов и сайтов
+- Рассказывай про лучшие практики ИБ
+- Отвечай на вопросы про OWASP, CVE, CWE
+Отвечай на РУССКОМ. Используй markdown. Будь экспертом, но объясняй понятно."""
 
 scan_lock = threading.Lock()
 current_scan = {'id': None, 'processes': [], 'cancelled': False}
@@ -373,6 +434,126 @@ def scan_report(scan_id):
 @login_required
 def history():
     return jsonify(get_history(user_id=g.user['id']))
+
+
+# ---------------------------------------------------------------------------
+#  ИИ-консультант (Gemini)
+# ---------------------------------------------------------------------------
+
+def summarize_report(report):
+    """Формирует краткую текстовую сводку отчёта для промпта Gemini."""
+    lines = [f"Цель сканирования: {report.get('target', '?')}"]
+    for host in report.get('hosts', []):
+        lines.append(f"\nХост: {host.get('hostname') or host.get('ip')} ({host.get('ip')})")
+
+        ports = host.get('open_ports', [])
+        if ports:
+            lines.append("Открытые порты: " + ', '.join(
+                f"{p['port']}/{p.get('protocol','tcp')} ({p.get('service','?')})" for p in ports
+            ))
+
+        os_guesses = host.get('os_guesses', [])
+        if os_guesses:
+            lines.append("ОС: " + ', '.join(f"{o['name']} ({o['accuracy']}%)" for o in os_guesses))
+
+        services = host.get('services', [])
+        if services:
+            lines.append("Службы: " + ', '.join(f"{s['port']}: {s['name']}" for s in services))
+
+        certs = host.get('ssl_certs', [])
+        if certs:
+            for c in certs:
+                lines.append(f"SSL-сертификат (порты {c.get('ports')}): выдан на {c.get('subject')}, "
+                             f"издатель {c.get('issuer')}, до {c.get('valid_after')}"
+                             + (" [НЕСООТВЕТСТВИЕ ДОМЕНА!]" if c.get('domain_mismatch') else ""))
+
+        ciphers = host.get('ssl_ciphers', [])
+        if ciphers:
+            for c in ciphers:
+                lines.append(f"TLS порт {c['port']}: протоколы {c.get('protocols')}, оценка {c.get('grade')}")
+
+        hc = host.get('headers_check')
+        if hc and not hc.get('error'):
+            missing = hc.get('missing', [])
+            if missing:
+                lines.append("Отсутствуют заголовки безопасности: " + ', '.join(missing))
+            else:
+                lines.append("Все основные заголовки безопасности присутствуют.")
+
+        vulns = host.get('vuln_findings', [])
+        if vulns:
+            for v in vulns:
+                lines.append(f"Уязвимость (порт {v['port']}, {v['script']}): {v['output'][:300]}")
+
+        nikto = host.get('nikto_findings', [])
+        if nikto:
+            lines.append("Nikto находки:\n" + '\n'.join(f"  - {n}" for n in nikto))
+
+    return '\n'.join(lines)
+
+
+@app.route('/api/ask', methods=['POST'])
+@login_required
+def ask_ai():
+    if not GEMINI_API_KEY or GEMINI_API_KEY == 'ВСТАВЬ_СЮДА_СВОЙ_КЛЮЧ':
+        return jsonify({'error': 'API-ключ Gemini не настроен. Укажите GEMINI_API_KEY в файле .env'}), 500
+
+    data = request.get_json(silent=True) or {}
+    question = (data.get('question') or '').strip()
+    chat_history = data.get('history') or []
+    scan_id = data.get('scan_id')
+
+    if not question:
+        return jsonify({'error': 'Введите вопрос'}), 400
+
+    system_text = GEMINI_SYSTEM_PROMPT_NO_REPORT
+
+    # Если есть скан, добавляем его в контекст
+    if scan_id:
+        scan = get_scan(scan_id, user_id=g.user['id'])
+        if scan and scan['status'] == 'done' and 'report' in scan:
+            report_summary = summarize_report(scan['report'])
+            system_text = (
+                GEMINI_SYSTEM_PROMPT
+                + "\n\n--- ОТЧЁТ СКАНИРОВАНИЯ ---\n"
+                + report_summary
+                + "\n--- КОНЕЦ ОТЧЁТА ---"
+            )
+
+    # Формируем историю диалога
+    contents = []
+    for msg in chat_history[-10:]:  # Последние 10 сообщений
+        role = 'user' if msg.get('role') == 'user' else 'model'
+        contents.append({'role': role, 'parts': [{'text': msg['text']}]})
+    
+    contents.append({'role': 'user', 'parts': [{'text': question}]})
+
+    body = {
+        'system_instruction': {'parts': [{'text': system_text}]},
+        'contents': contents,
+        'generationConfig': {
+            'temperature': 0.7,
+            'maxOutputTokens': 2048,
+        },
+    }
+
+    try:
+        resp = http_client.post(
+            GEMINI_URL,
+            params={'key': GEMINI_API_KEY},
+            json=body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        answer = result['candidates'][0]['content']['parts'][0]['text']
+        return jsonify({'answer': answer})
+    except http_client.exceptions.Timeout:
+        return jsonify({'error': 'Gemini не ответил вовремя. Попробуйте ещё раз.'}), 504
+    except http_client.exceptions.RequestException as e:
+        return jsonify({'error': f'Ошибка связи с Gemini: {str(e)}'}), 502
+    except (KeyError, IndexError):
+        return jsonify({'error': 'Gemini вернул некорректный ответ'}), 502
 
 
 # ---------------------------------------------------------------------------

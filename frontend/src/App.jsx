@@ -336,6 +336,149 @@ function Report({ report }) {
 }
 
 /* ======================================================================== */
+/*  Компонент: ИИ-чат (Gemini-консультант)                                  */
+/* ======================================================================== */
+
+const SCAN_QUESTIONS = [
+  '💡 Оцени общий уровень безопасности',
+  '⚠️ Какие главные угрозы?',
+  '🛡️ Как исправить заголовки?',
+  '🔒 Что с сертификатами?',
+  '📋 Составь план защиты',
+]
+
+const GENERAL_QUESTIONS = [
+  'Что такое OWASP Top 10?',
+  'Как защитить Nginx от DDoS?',
+  'Чем опасен открытый порт 3306?',
+  'Как настроить HSTS?',
+]
+
+function formatAiText(text) {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3 style="margin:12px 0 6px">$1</h3>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>')
+    .replace(/\n/g, '<br/>')
+}
+
+function AiChat({ scanId }) {
+  const [open, setOpen] = useState(false)
+  const [messages, setMessages] = useState([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const messagesEndRef = useCallback((node) => {
+    if (node) node.scrollIntoView({ behavior: 'smooth' })
+  }, [])
+
+  const quickQuestions = scanId ? SCAN_QUESTIONS : GENERAL_QUESTIONS
+
+  const sendQuestion = async (text) => {
+    if (!text.trim() || loading) return
+    const userMsg = { role: 'user', text: text.trim() }
+    const newMessages = [...messages, userMsg]
+    setMessages(newMessages)
+    setInput('')
+    setLoading(true)
+
+    try {
+      const data = await api('/api/ask', {
+        method: 'POST',
+        body: JSON.stringify({
+          question: text.trim(),
+          history: newMessages.slice(-10),
+          scan_id: scanId || null,
+        }),
+      })
+      setMessages((prev) => [...prev, { role: 'ai', text: data.answer }])
+    } catch (err) {
+      setMessages((prev) => [...prev, { role: 'ai', text: `❌ ${err.message}` }])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    sendQuestion(input)
+  }
+
+  if (!open) {
+    return (
+      <button className="ai-fab" onClick={() => setOpen(true)} title="ИБ-аналитик AI">
+        🤖
+      </button>
+    )
+  }
+
+  return (
+    <div className="ai-chat">
+      <div className="ai-chat-header">
+        <span>{scanId ? '🤖 SiteScanner AI (Анализ отчёта)' : '🤖 SiteScanner AI (Эксперт)'}</span>
+        <button className="ai-chat-close" onClick={() => setOpen(false)}>✕</button>
+      </div>
+
+      <div className="ai-chat-messages">
+        {messages.length === 0 && (
+          <div className="ai-welcome">
+            <p>{scanId 
+              ? 'Привет! Я изучил результаты сканирования. Что вас интересует?' 
+              : 'Привет! Я эксперт по кибербезопасности. Чем могу помочь?'}</p>
+            <div className="ai-chips">
+              {quickQuestions.map((q, i) => (
+                <button key={i} className="ai-chip" onClick={() => sendQuestion(q)}>
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {messages.map((msg, i) => (
+          <div key={i} className={`ai-msg ${msg.role}`}>
+            <div className="ai-msg-label">{msg.role === 'user' ? '👤 Вы' : '🤖 ИИ'}</div>
+            {msg.role === 'ai' ? (
+              <div className="ai-msg-text" dangerouslySetInnerHTML={{ __html: formatAiText(msg.text) }} />
+            ) : (
+              <div className="ai-msg-text">{msg.text}</div>
+            )}
+          </div>
+        ))}
+        {loading && (
+          <div className="ai-msg ai">
+            <div className="ai-msg-label">🤖 ИИ</div>
+            <div className="ai-msg-text"><span className="ai-typing">Думаю<span className="dots">...</span></span></div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {messages.length > 0 && !loading && (
+        <div className="ai-chips-bar">
+          {quickQuestions.slice(0, 3).map((q, i) => (
+            <button key={i} className="ai-chip small" onClick={() => sendQuestion(q)}>
+              {q}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <form className="ai-chat-input" onSubmit={handleSubmit}>
+        <input
+          type="text"
+          placeholder="Задайте вопрос..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={loading}
+        />
+        <button type="submit" disabled={!input.trim() || loading}>➤</button>
+      </form>
+    </div>
+  )
+}
+
+/* ======================================================================== */
 /*  Компонент: Админ-панель                                                 */
 /* ======================================================================== */
 
@@ -606,6 +749,7 @@ function App() {
   const loadHistoryReport = async (id) => {
     try {
       const data = await api(`/api/scan/${id}/report`)
+      setScanId(id)
       setReport(data)
       setShowReport(true)
       setStatus('done')
@@ -723,6 +867,9 @@ function App() {
           {showReport && report && <Report report={report} />}
         </main>
       )}
+
+      {/* ИИ всегда доступен. Если открыт отчёт — он его видит */}
+      <AiChat scanId={showReport ? scanId : null} />
     </>
   )
 }
